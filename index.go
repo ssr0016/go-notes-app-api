@@ -221,8 +221,463 @@ func main() {
 			"email":       user.Email,
 			"accessToken": tokenString,
 		})
-
 	})
 
-	log.Fatal(app.Listen(":3000"))
+	// Get User
+	app.Get("/get-user", authenticationToken, func(c *fiber.Ctx) error {
+		// Get user id from middleware
+		userID := c.Locals("user_id")
+
+		if userID == nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"message": "Unauthorized",
+			})
+		}
+
+		objectID, err := primitive.ObjectIDFromHex(userID.(string))
+		if err != nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"message": "Invalid user ID",
+			})
+		}
+
+		// MongoDB collection
+		userCollection := Client.Database("go-notes-app").Collection("users")
+
+		var isUser models.User
+
+		err = userCollection.FindOne(context.Background(), bson.M{
+			"_id": objectID,
+		}).Decode(&isUser)
+		if err != nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"message": "User not found",
+			})
+		}
+
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"user": fiber.Map{
+				"fullName":  isUser.FullName,
+				"email":     isUser.Email,
+				"_id":       isUser.ID,
+				"createdOn": isUser.CreatedOn,
+			},
+			"message": "",
+		})
+	})
+
+	// Add Note
+	app.Post("/add-note", authenticationToken, func(c *fiber.Ctx) error {
+		type AddNoteRequest struct {
+			Title   string   `json:"title"`
+			Content string   `json:"content"`
+			Tags    []string `json:"tags"`
+		}
+
+		// Get user ID from middleware
+		userID := c.Locals("user_id")
+		if userID == nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"message": "Unauthorized",
+			})
+		}
+
+		var body AddNoteRequest
+		if err := c.BodyParser(&body); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "Invalid request"})
+		}
+
+		// Validation
+		if body.Title == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "Please enter a title."})
+		}
+
+		if body.Content == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "Please enter a content."})
+		}
+
+		// Convert string ID to ObjectID
+		objectID := userID.(string)
+
+		// Create Note Struct
+		note := models.Note{
+			Title:     body.Title,
+			Content:   body.Content,
+			Tags:      body.Tags,
+			UserID:    objectID,
+			CreatedOn: time.Now(),
+		}
+
+		// MongoDB collection
+		noteCollection := Client.Database("go-notes-app").Collection("notes")
+
+		// Insert into MongoDB
+		insertResult, err := noteCollection.InsertOne(context.Background(), note)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error":   true,
+				"message": "Internal Server Error",
+			})
+		}
+
+		// Set the generated ID in note
+		note.ID = insertResult.InsertedID.(primitive.ObjectID)
+
+		// Return response
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"error":   false,
+			"note":    note,
+			"message": "Note added successfully.",
+		})
+	})
+
+	// Edit Note
+	app.Put("/edit-note/:noteId", authenticationToken, func(c *fiber.Ctx) error {
+		type UpdateNoteRequest struct {
+			Title    string   `json:"title"`
+			Content  string   `json:"content"`
+			Tags     []string `json:"tags"`
+			IsPinned *bool    `json:"isPinned"`
+		}
+
+		// Get noteId from URL params
+		noteID := c.Params("noteId")
+		if noteID == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"message": "Missing note ID",
+			})
+		}
+
+		// Get user ID from middleware
+		userID := c.Locals("user_id")
+		if userID == nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"message": "Unauthorized",
+			})
+		}
+
+		// Parse body
+		var body UpdateNoteRequest
+		if err := c.BodyParser(&body); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"message": "Invalid request",
+			})
+		}
+
+		// Validation
+		if body.Title == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "Please enter a title."})
+		}
+
+		if body.Content == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"message": "Please enter a content."})
+		}
+
+		// Convert noteID to ObjectID
+		objID, err := primitive.ObjectIDFromHex(noteID)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"message": "Invalid note ID",
+			})
+		}
+
+		// MongoDB collection
+		noteCollection := Client.Database("go-notes-app").Collection("notes")
+
+		// Find note by _id and userId
+		var note models.Note
+		err = noteCollection.FindOne(context.Background(), bson.M{
+			"_id":    objID,
+			"userId": userID.(string),
+		}).Decode(&note)
+		if err != nil {
+			return c.Status(fiber.StatusFound).JSON(fiber.Map{
+				"message": "Note not found",
+			})
+		}
+
+		// Update fields if provided
+		update := bson.M{}
+		if body.Title != "" {
+			update["title"] = body.Title
+		}
+		if body.Content != "" {
+			update["content"] = body.Content
+		}
+		if body.Tags != nil {
+			update["tags"] = body.Tags
+		}
+		if body.IsPinned != nil {
+			update["isPinned"] = *body.IsPinned
+		}
+
+		// Update in MongoDB
+		_, err = noteCollection.UpdateOne(context.Background(), bson.M{"_id": objID, "userId": userID.(string)}, bson.M{"$set": update})
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error":   true,
+				"message": "Internal Server Error",
+			})
+		}
+
+		// Return updated one
+		// You can optionally re-fetch the updated note, or just merge fields locally
+		for k, v := range update {
+			switch k {
+			case "title":
+				note.Title = v.(string)
+			case "content":
+				note.Content = v.(string)
+			case "tags":
+				note.Tags = v.([]string)
+			case "isPinned":
+				note.IsPinned = v.(bool)
+			}
+		}
+
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"error":   false,
+			"note":    note,
+			"message": "Note updated successfully",
+		})
+	})
+
+	app.Get("/get-all-notes", authenticationToken, func(c *fiber.Ctx) error {
+		// Get user ID from middleware
+		userID := c.Locals("user_id")
+		if userID == nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"message": "Unauthorized",
+			})
+		}
+
+		// MongoDB collection
+		noteCollection := Client.Database("go-notes-app").Collection("notes")
+
+		// Filter: notes for this user
+		filter := bson.M{"userId": userID.(string)}
+
+		// Sort: pinned notes first
+		findOptions := options.Find()
+		findOptions.SetSort(bson.D{{Key: "isPinned", Value: -1}})
+
+		// Query MongoDB
+		cursor, err := noteCollection.Find(context.Background(), filter, findOptions)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error":   true,
+				"message": "Internal Server Error",
+			})
+		}
+		defer cursor.Close(context.Background())
+
+		// Decode all notes
+		var notes []models.Note
+		if err := cursor.All(context.Background(), &notes); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error":   true,
+				"message": "Internal Server Error",
+			})
+		}
+
+		// Return response
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"error":   false,
+			"notes":   notes,
+			"message": "Notes fetched successfully",
+		})
+	})
+
+	// Delete Note
+	app.Delete("/delete-note/:noteId", authenticationToken, func(c *fiber.Ctx) error {
+		// Get noteId from URL params
+		noteID := c.Params("noteId")
+		if noteID == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"message": "Missing note ID",
+			})
+		}
+
+		// Get user ID from middleware
+		userID := c.Locals("user_id")
+		if userID == nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"message": "Unauthorized",
+			})
+		}
+
+		// Convert noteID to ObjectID
+		objID, err := primitive.ObjectIDFromHex(noteID)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"message": "Invalid note ID",
+			})
+		}
+
+		// MongoDB collection
+		noteCollection := Client.Database("go-notes-app").Collection("notes")
+
+		// Check if note exists for this user
+		var note models.Note
+		err = noteCollection.FindOne(context.Background(), bson.M{
+			"_id":    objID,
+			"userId": userID.(string),
+		}).Decode(&note)
+		if err != nil {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"message": "Note not found",
+			})
+		}
+
+		// Delete the note
+		_, err = noteCollection.DeleteOne(context.Background(), bson.M{
+			"_id":    objID,
+			"userId": userID.(string),
+		})
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error":   true,
+				"message": "Internal Server Error",
+			})
+		}
+
+		// Return success
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"error":   false,
+			"message": "Note deleted successfully",
+		})
+	})
+
+	app.Put("/update-note-pinned/:noteId", authenticationToken, func(c *fiber.Ctx) error {
+		// Get noteId from URL params
+		noteID := c.Params("noteId")
+		if noteID == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"message": "Missing note ID",
+			})
+		}
+
+		// Get user ID from middleware
+		userID := c.Locals("user_id")
+		if userID == nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"message": "Unauthorized",
+			})
+		}
+
+		// Parse request body
+		type UpdatePinnedRequest struct {
+			IsPinned bool `json:"isPinned"`
+		}
+
+		var body UpdatePinnedRequest
+		if err := c.BodyParser(&body); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"message": "Invalid request",
+			})
+		}
+
+		// Convert noteID to ObjectID
+		objID, err := primitive.ObjectIDFromHex(noteID)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"message": "Invalid note ID",
+			})
+		}
+
+		// MongoDB collection
+		noteCollection := Client.Database("go-notes-app").Collection("notes")
+
+		// Find the note for this user
+		var note models.Note
+		err = noteCollection.FindOne(context.Background(), bson.M{
+			"_id":    objID,
+			"userId": userID.(string),
+		}).Decode(&note)
+		if err != nil {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"message": "Note not found",
+			})
+		}
+
+		// Update isPinned value
+		update := bson.M{"isPinned": body.IsPinned}
+		_, err = noteCollection.UpdateOne(
+			context.Background(),
+			bson.M{"_id": objID, "userId": userID.(string)},
+			bson.M{"$set": update},
+		)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error":   true,
+				"message": "Internal Server Error",
+			})
+		}
+
+		// Update the note struct locally to return updated value
+		note.IsPinned = body.IsPinned
+
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"error":   false,
+			"note":    note,
+			"message": "Note updated successfully",
+		})
+	})
+
+	app.Get("/search-notes/", authenticationToken, func(c *fiber.Ctx) error {
+		// Get user ID from middleware
+		userID := c.Locals("user_id")
+		if userID == nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"message": "Unauthorized",
+			})
+		}
+
+		// Get query parameter
+		query := c.Query("query")
+		if query == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error":   true,
+				"message": "Search query is required.",
+			})
+		}
+
+		// MongoDB collection
+		noteCollection := Client.Database("go-notes-app").Collection("notes")
+
+		// Search filter: match title or content (case-insensitive)
+		filter := bson.M{
+			"userId": userID.(string),
+			"$or": []bson.M{
+				{"title": bson.M{"$regex": query, "$options": "i"}},
+				{"content": bson.M{"$regex": query, "$options": "i"}},
+			},
+		}
+
+		// Find matching notes
+		cursor, err := noteCollection.Find(context.Background(), filter)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error":   true,
+				"message": "Internal Server Error",
+			})
+		}
+		defer cursor.Close(context.Background())
+
+		notes := []models.Note{}
+		if err := cursor.All(context.Background(), &notes); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error":   true,
+				"message": "Internal Server Error",
+			})
+		}
+
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"error":   false,
+			"notes":   notes,
+			"message": "Notes matching the search query retrieved successfully.",
+		})
+	})
+
+	log.Fatal(app.Listen(":8000"))
 }

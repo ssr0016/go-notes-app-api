@@ -1,3 +1,4 @@
+// Package models contains MongoDB data models for the Go Notes app.
 package models
 
 import (
